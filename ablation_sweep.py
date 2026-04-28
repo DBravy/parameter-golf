@@ -10,6 +10,10 @@ Usage:
     python ablation_sweep.py --mode noise_pretrain
     python ablation_sweep.py --mode noise_pretrain --noise_steps_list "0,100,500,1000" --seeds "1337"
 
+    # Memory pathway sweep (MEM_DIM=0 reproduces the baseline architecture)
+    python ablation_sweep.py --mode memory
+    python ablation_sweep.py --mode memory --mem_dims "0,64,128,256" --seeds "1337"
+
     python ablation_sweep.py --nproc 4
 """
 
@@ -35,6 +39,8 @@ LAMBDAS_DEFAULT = [
 ]
 
 NOISE_STEPS_DEFAULT = [0, 100, 500, 1000, 2000]
+
+MEM_DIMS_DEFAULT = [0, 32, 64, 128]
 
 SEEDS_DEFAULT = [1337, 42, 7]
 
@@ -171,6 +177,69 @@ def run_noise_pretrain_sweep(noise_steps_list, seeds, nproc):
     return results
 
 
+def run_memory_sweep(mem_dims, seeds, nproc):
+    results = []
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+
+    for seed in seeds:
+        for md in mem_dims:
+            if md == 0:
+                run_id = f"baseline_mem_seed{seed}"
+            else:
+                run_id = f"mem{md}_seed{seed}"
+            log_path = log_dir / f"{run_id}.txt"
+
+            if log_path.exists():
+                print(f"Skipping {run_id} (log exists at {log_path})")
+                log_text = log_path.read_text()
+                metrics = parse_final_metrics(log_text)
+                if metrics:
+                    results.append({"mem_dim": md, "seed": seed, **metrics})
+                continue
+
+            print(f"\n{'=' * 60}")
+            print(f"  mem_dim={md}  seed={seed}")
+            print(f"{'=' * 60}\n")
+
+            # MEM_DIM is consumed by Hyperparameters in train_gpt.py at import
+            # time, so each subprocess picks it up cleanly. No runner flag needed.
+            env = os.environ.copy()
+            env["SEED"] = str(seed)
+            env["RUN_ID"] = run_id
+            env["MEM_DIM"] = str(md)
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                f"--nproc_per_node={nproc}",
+                "ablation_runner.py",
+            ]
+
+            with open(log_path, "w") as log_file:
+                proc = subprocess.run(
+                    cmd,
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+
+            if proc.returncode != 0:
+                print(f"  FAILED (exit code {proc.returncode}) — see {log_path}")
+                continue
+
+            log_text = log_path.read_text()
+            metrics = parse_final_metrics(log_text)
+            if metrics:
+                results.append({"mem_dim": md, "seed": seed, **metrics})
+                print(f"  val_bpb={metrics['val_bpb']:.4f}  val_loss={metrics['val_loss']:.4f}")
+            else:
+                print(f"  WARNING: no metrics found in {log_path}")
+
+    return results
+
+
 def print_hybrid_loss_summary(results):
     if not results:
         print("\nNo results to summarize.")
@@ -241,14 +310,49 @@ def print_noise_pretrain_summary(results):
     print(f"\n  Full results saved to {out_path}")
 
 
+def print_memory_summary(results):
+    if not results:
+        print("\nNo results to summarize.")
+        return
+
+    by_md = defaultdict(list)
+    for r in results:
+        by_md[r["mem_dim"]].append(r)
+
+    print(f"\n{'=' * 62}")
+    print("  ABLATION SUMMARY — Memory Pathway")
+    print(f"{'=' * 62}")
+    print(f"  {'mem_dim':>8}  {'val_bpb (mean)':>15}  {'val_bpb (std)':>13}  {'n':>3}")
+    print(f"  {'-' * 45}")
+
+    for md in sorted(by_md.keys()):
+        runs = by_md[md]
+        bpbs = [r["val_bpb"] for r in runs if "val_bpb" in r]
+        if not bpbs:
+            continue
+        mean = sum(bpbs) / len(bpbs)
+        if len(bpbs) > 1:
+            var = sum((b - mean) ** 2 for b in bpbs) / (len(bpbs) - 1)
+            std = var**0.5
+        else:
+            std = 0.0
+        label = "baseline" if md == 0 else str(md)
+        print(f"  {label:>8}  {mean:>15.4f}  {std:>13.4f}  {len(bpbs):>3}")
+
+    out_path = "ablation_memory_results.json"
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Full results saved to {out_path}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ablation sweep launcher")
     parser.add_argument(
         "--mode",
         type=str,
         default="hybrid_loss",
-        choices=["hybrid_loss", "noise_pretrain"],
-        help="Sweep mode: 'hybrid_loss' (lambda sweep) or 'noise_pretrain' (noise steps sweep)",
+        choices=["hybrid_loss", "noise_pretrain", "memory"],
+        help="Sweep mode: 'hybrid_loss' (lambda sweep), 'noise_pretrain' (noise steps sweep), or 'memory' (mem_dim sweep)",
     )
     parser.add_argument(
         "--lambdas",
@@ -261,6 +365,12 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Comma-separated noise step counts (default: 0,100,500,1000,2000)",
+    )
+    parser.add_argument(
+        "--mem_dims",
+        type=str,
+        default=None,
+        help="Comma-separated MEM_DIM values; 0 disables the memory pathway (default: 0,32,64,128)",
     )
     parser.add_argument(
         "--seeds",
@@ -293,3 +403,11 @@ if __name__ == "__main__":
         )
         results = run_noise_pretrain_sweep(noise_steps_list, seeds, args.nproc)
         print_noise_pretrain_summary(results)
+    elif args.mode == "memory":
+        mem_dims = (
+            [int(x) for x in args.mem_dims.split(",")]
+            if args.mem_dims
+            else MEM_DIMS_DEFAULT
+        )
+        results = run_memory_sweep(mem_dims, seeds, args.nproc)
+        print_memory_summary(results)
