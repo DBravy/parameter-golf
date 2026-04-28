@@ -27,6 +27,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+_TRAIN_LOSS_FN = None  # Set before main() to override training loss
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -659,6 +661,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        loss_fn=None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +669,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.loss_fn = loss_fn
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -721,6 +725,8 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        if self.training and self.loss_fn is not None:
+            return self.loss_fn(logits.float(), targets)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -835,6 +841,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        loss_fn=_TRAIN_LOSS_FN,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
