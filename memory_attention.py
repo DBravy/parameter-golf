@@ -111,12 +111,13 @@ class MemoryAttention(nn.Module):
         out = self.o_proj(out)                                     # (B, T, dim)
 
         # 5. Cross-batch cache write. Average over batch dim, FIFO push.
-        with torch.no_grad():
-            new_slots = summaries.detach().mean(dim=0)             # (n_seg, mem_dim)
-            new_slots = new_slots.to(self.cache.dtype)
-            n_new = new_slots.size(0)
-            self.cache.copy_(
-                torch.cat([self.cache[n_new:], new_slots], dim=0)
-            )
+        # Pure .detach() (no torch.no_grad context) keeps this compile-friendly
+        # under torch.compile(fullgraph=True). The .detach() on self.cache[n_new:]
+        # is redundant for a buffer (no autograd) but makes the data flow explicit.
+        new_slots = summaries.detach().mean(dim=0).to(self.cache.dtype)
+        n_new = new_slots.size(0)
+        self.cache.copy_(
+            torch.cat([self.cache[n_new:].detach(), new_slots], dim=0)
+        )
 
         return out

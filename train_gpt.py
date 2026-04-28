@@ -645,19 +645,26 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.memory = MemoryAttention(dim, mem_dim, num_segments, cache_size)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mem_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # Memory pathway is opt-in. mem_dim=0 disables it entirely (no module,
+        # no parameters, no compute), so MEM_DIM=0 reproduces the baseline.
+        if mem_dim > 0:
+            self.memory = MemoryAttention(dim, mem_dim, num_segments, cache_size)
+            self.mem_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        else:
+            self.memory = None
+            self.mem_scale = None
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        mem_out = self.memory(self.attn_norm(x))
-        x = x + self.mem_scale.to(dtype=x.dtype)[None, None, :] * mem_out
+        if self.memory is not None:
+            mem_out = self.memory(self.attn_norm(x))
+            x = x + self.mem_scale.to(dtype=x.dtype)[None, None, :] * mem_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
