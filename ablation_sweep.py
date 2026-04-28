@@ -56,10 +56,39 @@ def parse_final_metrics(log_lines: str) -> dict:
     return metrics
 
 
-def run_hybrid_loss_sweep(lambdas, seeds, nproc):
+def _ask_overwrite(log_path: Path, state: dict) -> bool:
+    """Prompt about an existing log. Returns True to overwrite, False to skip.
+
+    state['all_yes'] / state['all_no'] persist across calls so that a single
+    answer (a / s) can apply to the rest of the sweep.
+    """
+    if state.get("all_yes"):
+        return True
+    if state.get("all_no"):
+        return False
+    prompt = (
+        f"  Log exists at {log_path}.\n"
+        f"  Overwrite? [y]es / [N]o / [a]ll-yes / [s]kip-all-remaining: "
+    )
+    try:
+        ans = input(prompt).strip().lower()
+    except EOFError:
+        # Non-interactive shell: preserve the original skip-on-exists behavior.
+        return False
+    if ans in ("a", "all"):
+        state["all_yes"] = True
+        return True
+    if ans in ("s", "skip", "skip-all"):
+        state["all_no"] = True
+        return False
+    return ans in ("y", "yes")
+
+
+def run_hybrid_loss_sweep(lambdas, seeds, nproc, force=False):
     results = []
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
+    overwrite_state = {"all_yes": force, "all_no": False}
 
     for seed in seeds:
         for lam in lambdas:
@@ -67,12 +96,15 @@ def run_hybrid_loss_sweep(lambdas, seeds, nproc):
             log_path = log_dir / f"{run_id}.txt"
 
             if log_path.exists():
-                print(f"Skipping {run_id} (log exists at {log_path})")
-                log_text = log_path.read_text()
-                metrics = parse_final_metrics(log_text)
-                if metrics:
-                    results.append({"lambda": lam, "seed": seed, **metrics})
-                continue
+                if _ask_overwrite(log_path, overwrite_state):
+                    print(f"Overwriting {run_id}")
+                else:
+                    print(f"Skipping {run_id} (log exists at {log_path})")
+                    log_text = log_path.read_text()
+                    metrics = parse_final_metrics(log_text)
+                    if metrics:
+                        results.append({"lambda": lam, "seed": seed, **metrics})
+                    continue
 
             print(f"\n{'=' * 60}")
             print(f"  lambda={lam:g}  seed={seed}")
@@ -115,10 +147,11 @@ def run_hybrid_loss_sweep(lambdas, seeds, nproc):
     return results
 
 
-def run_noise_pretrain_sweep(noise_steps_list, seeds, nproc):
+def run_noise_pretrain_sweep(noise_steps_list, seeds, nproc, force=False):
     results = []
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
+    overwrite_state = {"all_yes": force, "all_no": False}
 
     for seed in seeds:
         for ns in noise_steps_list:
@@ -129,12 +162,15 @@ def run_noise_pretrain_sweep(noise_steps_list, seeds, nproc):
             log_path = log_dir / f"{run_id}.txt"
 
             if log_path.exists():
-                print(f"Skipping {run_id} (log exists at {log_path})")
-                log_text = log_path.read_text()
-                metrics = parse_final_metrics(log_text)
-                if metrics:
-                    results.append({"noise_steps": ns, "seed": seed, **metrics})
-                continue
+                if _ask_overwrite(log_path, overwrite_state):
+                    print(f"Overwriting {run_id}")
+                else:
+                    print(f"Skipping {run_id} (log exists at {log_path})")
+                    log_text = log_path.read_text()
+                    metrics = parse_final_metrics(log_text)
+                    if metrics:
+                        results.append({"noise_steps": ns, "seed": seed, **metrics})
+                    continue
 
             print(f"\n{'=' * 60}")
             print(f"  noise_steps={ns}  seed={seed}")
@@ -177,10 +213,11 @@ def run_noise_pretrain_sweep(noise_steps_list, seeds, nproc):
     return results
 
 
-def run_memory_sweep(mem_dims, seeds, nproc):
+def run_memory_sweep(mem_dims, seeds, nproc, force=False):
     results = []
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
+    overwrite_state = {"all_yes": force, "all_no": False}
 
     for seed in seeds:
         for md in mem_dims:
@@ -191,12 +228,15 @@ def run_memory_sweep(mem_dims, seeds, nproc):
             log_path = log_dir / f"{run_id}.txt"
 
             if log_path.exists():
-                print(f"Skipping {run_id} (log exists at {log_path})")
-                log_text = log_path.read_text()
-                metrics = parse_final_metrics(log_text)
-                if metrics:
-                    results.append({"mem_dim": md, "seed": seed, **metrics})
-                continue
+                if _ask_overwrite(log_path, overwrite_state):
+                    print(f"Overwriting {run_id}")
+                else:
+                    print(f"Skipping {run_id} (log exists at {log_path})")
+                    log_text = log_path.read_text()
+                    metrics = parse_final_metrics(log_text)
+                    if metrics:
+                        results.append({"mem_dim": md, "seed": seed, **metrics})
+                    continue
 
             print(f"\n{'=' * 60}")
             print(f"  mem_dim={md}  seed={seed}")
@@ -379,6 +419,11 @@ if __name__ == "__main__":
         help="Comma-separated seeds (default: 1337,42,7)",
     )
     parser.add_argument("--nproc", type=int, default=8, help="GPUs per run")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite all existing logs without prompting.",
+    )
     args = parser.parse_args()
 
     seeds = (
@@ -393,7 +438,7 @@ if __name__ == "__main__":
             if args.lambdas
             else LAMBDAS_DEFAULT
         )
-        results = run_hybrid_loss_sweep(lambdas, seeds, args.nproc)
+        results = run_hybrid_loss_sweep(lambdas, seeds, args.nproc, force=args.overwrite)
         print_hybrid_loss_summary(results)
     elif args.mode == "noise_pretrain":
         noise_steps_list = (
@@ -401,7 +446,7 @@ if __name__ == "__main__":
             if args.noise_steps_list
             else NOISE_STEPS_DEFAULT
         )
-        results = run_noise_pretrain_sweep(noise_steps_list, seeds, args.nproc)
+        results = run_noise_pretrain_sweep(noise_steps_list, seeds, args.nproc, force=args.overwrite)
         print_noise_pretrain_summary(results)
     elif args.mode == "memory":
         mem_dims = (
@@ -409,5 +454,5 @@ if __name__ == "__main__":
             if args.mem_dims
             else MEM_DIMS_DEFAULT
         )
-        results = run_memory_sweep(mem_dims, seeds, args.nproc)
+        results = run_memory_sweep(mem_dims, seeds, args.nproc, force=args.overwrite)
         print_memory_summary(results)
