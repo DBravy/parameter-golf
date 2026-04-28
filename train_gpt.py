@@ -27,6 +27,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from memory_attention import MemoryAttention
+
 _TRAIN_LOSS_FN = None  # Set before main() to override training loss
 _PRE_TRAIN_HOOK = None  # Called with (base_model, device, args) after init, before compile
 
@@ -72,6 +74,11 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # Memory pathway hyperparameters.
+    mem_dim = int(os.environ.get("MEM_DIM", 64))
+    num_segments = int(os.environ.get("NUM_SEGMENTS", 4))
+    cache_size = int(os.environ.get("CACHE_SIZE", 64))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -292,7 +299,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,mem_scale,mem_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -629,14 +636,19 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        mem_dim: int,
+        num_segments: int,
+        cache_size: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
+        self.memory = MemoryAttention(dim, mem_dim, num_segments, cache_size)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mem_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
@@ -644,6 +656,8 @@ class Block(nn.Module):
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        mem_out = self.memory(self.attn_norm(x))
+        x = x + self.mem_scale.to(dtype=x.dtype)[None, None, :] * mem_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -662,6 +676,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        mem_dim: int,
+        num_segments: int,
+        cache_size: int,
         loss_fn=None,
     ):
         super().__init__()
@@ -685,6 +702,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    mem_dim,
+                    num_segments,
+                    cache_size,
                 )
                 for i in range(num_layers)
             ]
@@ -842,6 +862,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        mem_dim=args.mem_dim,
+        num_segments=args.num_segments,
+        cache_size=args.cache_size,
         loss_fn=_TRAIN_LOSS_FN,
     ).to(device).bfloat16()
     for module in base_model.modules():
