@@ -92,6 +92,13 @@ class MemoryAttention(nn.Module):
         v_mem = self.v_proj(mem)
         q = self.q_proj(x)                                         # (B, T, mem_dim)
 
+        # Match the stability treatment in CausalSelfAttention: unit-RMS Q and
+        # K before the dot product. Without this, q.k drifts unboundedly across
+        # training, eventually causing bf16 overflow and NaN losses. The effect
+        # scales with mem_dim, which is why mem128 saw the worst divergence.
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+
         # 3. Visibility mask: persistent slots always visible; within-batch
         #    summary s visible to token t iff s < (t // seg_len).
         device = x.device
