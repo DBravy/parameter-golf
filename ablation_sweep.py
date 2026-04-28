@@ -1,9 +1,15 @@
 """
-Launch a sweep over lambda values for the hybrid loss ablation.
+Launch a sweep over ablation configurations.
 
 Usage:
+    # Hybrid loss sweep (default, existing behavior)
     python ablation_sweep.py
     python ablation_sweep.py --lambdas "0.0,0.1,0.3,0.5" --seeds "1337"
+
+    # Noise pretraining sweep
+    python ablation_sweep.py --mode noise_pretrain
+    python ablation_sweep.py --mode noise_pretrain --noise_steps_list "0,100,500,1000" --seeds "1337"
+
     python ablation_sweep.py --nproc 4
 """
 
@@ -28,6 +34,8 @@ LAMBDAS_DEFAULT = [
     1.0,
 ]
 
+NOISE_STEPS_DEFAULT = [0, 100, 500, 1000, 2000]
+
 SEEDS_DEFAULT = [1337, 42, 7]
 
 
@@ -42,7 +50,7 @@ def parse_final_metrics(log_lines: str) -> dict:
     return metrics
 
 
-def run_sweep(lambdas, seeds, nproc):
+def run_hybrid_loss_sweep(lambdas, seeds, nproc):
     results = []
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
@@ -101,7 +109,69 @@ def run_sweep(lambdas, seeds, nproc):
     return results
 
 
-def print_summary(results):
+def run_noise_pretrain_sweep(noise_steps_list, seeds, nproc):
+    results = []
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+
+    for seed in seeds:
+        for ns in noise_steps_list:
+            if ns == 0:
+                run_id = f"baseline_seed{seed}"
+            else:
+                run_id = f"noise{ns}_seed{seed}"
+            log_path = log_dir / f"{run_id}.txt"
+
+            if log_path.exists():
+                print(f"Skipping {run_id} (log exists at {log_path})")
+                log_text = log_path.read_text()
+                metrics = parse_final_metrics(log_text)
+                if metrics:
+                    results.append({"noise_steps": ns, "seed": seed, **metrics})
+                continue
+
+            print(f"\n{'=' * 60}")
+            print(f"  noise_steps={ns}  seed={seed}")
+            print(f"{'=' * 60}\n")
+
+            env = os.environ.copy()
+            env["SEED"] = str(seed)
+            env["RUN_ID"] = run_id
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                f"--nproc_per_node={nproc}",
+                "ablation_runner.py",
+                "--noise_steps",
+                str(ns),
+            ]
+
+            with open(log_path, "w") as log_file:
+                proc = subprocess.run(
+                    cmd,
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+
+            if proc.returncode != 0:
+                print(f"  FAILED (exit code {proc.returncode}) — see {log_path}")
+                continue
+
+            log_text = log_path.read_text()
+            metrics = parse_final_metrics(log_text)
+            if metrics:
+                results.append({"noise_steps": ns, "seed": seed, **metrics})
+                print(f"  val_bpb={metrics['val_bpb']:.4f}  val_loss={metrics['val_loss']:.4f}")
+            else:
+                print(f"  WARNING: no metrics found in {log_path}")
+
+    return results
+
+
+def print_hybrid_loss_summary(results):
     if not results:
         print("\nNo results to summarize.")
         return
@@ -111,7 +181,7 @@ def print_summary(results):
         by_lam[r["lambda"]].append(r)
 
     print(f"\n{'=' * 62}")
-    print("  ABLATION SUMMARY")
+    print("  ABLATION SUMMARY — Hybrid Loss")
     print(f"{'=' * 62}")
     print(f"  {'Lambda':>8}  {'val_bpb (mean)':>15}  {'val_bpb (std)':>13}  {'n':>3}")
     print(f"  {'-' * 45}")
@@ -130,20 +200,67 @@ def print_summary(results):
         label = "baseline" if lam < 0 else f"{lam:g}"
         print(f"  {label:>8}  {mean:>15.4f}  {std:>13.4f}  {len(bpbs):>3}")
 
-    # Save full results
     out_path = "ablation_results.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n  Full results saved to {out_path}")
 
 
+def print_noise_pretrain_summary(results):
+    if not results:
+        print("\nNo results to summarize.")
+        return
+
+    by_ns = defaultdict(list)
+    for r in results:
+        by_ns[r["noise_steps"]].append(r)
+
+    print(f"\n{'=' * 62}")
+    print("  ABLATION SUMMARY — Noise Pretraining")
+    print(f"{'=' * 62}")
+    print(f"  {'Steps':>8}  {'val_bpb (mean)':>15}  {'val_bpb (std)':>13}  {'n':>3}")
+    print(f"  {'-' * 45}")
+
+    for ns in sorted(by_ns.keys()):
+        runs = by_ns[ns]
+        bpbs = [r["val_bpb"] for r in runs if "val_bpb" in r]
+        if not bpbs:
+            continue
+        mean = sum(bpbs) / len(bpbs)
+        if len(bpbs) > 1:
+            var = sum((b - mean) ** 2 for b in bpbs) / (len(bpbs) - 1)
+            std = var**0.5
+        else:
+            std = 0.0
+        label = "baseline" if ns == 0 else str(ns)
+        print(f"  {label:>8}  {mean:>15.4f}  {std:>13.4f}  {len(bpbs):>3}")
+
+    out_path = "ablation_noise_pretrain_results.json"
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Full results saved to {out_path}")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Hybrid loss lambda sweep")
+    parser = argparse.ArgumentParser(description="Ablation sweep launcher")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="hybrid_loss",
+        choices=["hybrid_loss", "noise_pretrain"],
+        help="Sweep mode: 'hybrid_loss' (lambda sweep) or 'noise_pretrain' (noise steps sweep)",
+    )
     parser.add_argument(
         "--lambdas",
         type=str,
         default=None,
         help="Comma-separated lambda values (default: -1,0,0.05,0.1,0.2,0.3,0.5,0.7,1.0)",
+    )
+    parser.add_argument(
+        "--noise_steps_list",
+        type=str,
+        default=None,
+        help="Comma-separated noise step counts (default: 0,100,500,1000,2000)",
     )
     parser.add_argument(
         "--seeds",
@@ -154,16 +271,25 @@ if __name__ == "__main__":
     parser.add_argument("--nproc", type=int, default=8, help="GPUs per run")
     args = parser.parse_args()
 
-    lambdas = (
-        [float(x) for x in args.lambdas.split(",")]
-        if args.lambdas
-        else LAMBDAS_DEFAULT
-    )
     seeds = (
         [int(x) for x in args.seeds.split(",")]
         if args.seeds
         else SEEDS_DEFAULT
     )
 
-    results = run_sweep(lambdas, seeds, args.nproc)
-    print_summary(results)
+    if args.mode == "hybrid_loss":
+        lambdas = (
+            [float(x) for x in args.lambdas.split(",")]
+            if args.lambdas
+            else LAMBDAS_DEFAULT
+        )
+        results = run_hybrid_loss_sweep(lambdas, seeds, args.nproc)
+        print_hybrid_loss_summary(results)
+    elif args.mode == "noise_pretrain":
+        noise_steps_list = (
+            [int(x) for x in args.noise_steps_list.split(",")]
+            if args.noise_steps_list
+            else NOISE_STEPS_DEFAULT
+        )
+        results = run_noise_pretrain_sweep(noise_steps_list, seeds, args.nproc)
+        print_noise_pretrain_summary(results)

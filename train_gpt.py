@@ -28,6 +28,7 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 _TRAIN_LOSS_FN = None  # Set before main() to override training loss
+_PRE_TRAIN_HOOK = None  # Called with (base_model, device, args) after init, before compile
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -847,6 +848,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    if _PRE_TRAIN_HOOK is not None:
+        log0("pre_train_hook:starting")
+        _PRE_TRAIN_HOOK(base_model, device, args)
+        log0("pre_train_hook:done")
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
